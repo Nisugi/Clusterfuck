@@ -3,6 +3,16 @@
 
   This script uses Redis pub/sub from distributed RPC/communications.
 
+  Connection Modes:
+    ;cluster              # Connect to local Redis (default)
+    ;cluster --public     # Connect to public servers with failover
+    ;cluster --url=URL    # Connect to specific Redis URL
+
+  Public Server Failover (--public):
+    Tries servers in order: Contabo → Google Cloud → Upstash
+    Server configs are hardcoded in PUBLIC_SERVERS constant
+    Check connected server: Cluster.connected_server
+
   Cluster examples:
     Cluster.on_broadcast(:dead) do |_, req|
       Log.out("#{req.from} is dead")
@@ -31,13 +41,17 @@
   Author: Ondreian
   Requirements: Ruby >= 2.3, redis, connection_pool
   required: Lich >= 5.12.0
-  version: 1.0.0
+  version: 1.1.0
 
   Setup Instructions: https://github.com/elanthia-online/scripts/wiki/cluster.lic-Documentation
      Help Contribute: https://github.com/elanthia-online/scripts
 
   Version Control:
     Major_change.feature_addition.bugfix
+  v1.1.0  (2026-01-01)
+    - add --public flag for public server connection with failover
+    - add PUBLIC_SERVERS constant with hardcoded server configs
+    - add Cluster.connected_server method
   v1.0.0  (2025-10-27)
     - update version to semantic versioning
     - include link to setup instructions in header
@@ -147,6 +161,36 @@ class Cluster
   POOL_SIZE          = 5
   POOL_TIMEOUT       = 5
 
+  # Public Redis servers for --public mode (failover order)
+  # Servers are tried in order until one connects successfully
+  def self.load_public_servers
+    [
+      {
+        name: "contabo",
+        host: "158.220.127.134",
+        port: 42113,
+        password: "a9eK4!x9b2l",
+        ssl: false
+      },
+      {
+        name: "google",
+        host: "34.10.123.196",
+        port: 42113,
+        password: "a9eK4!x9b2l",
+        ssl: false
+      },
+      {
+        name: "upstash",
+        host: "sensible-vervet-9854.upstash.io",
+        port: 6379,
+        password: "ASZ-AAImcDJkZWNjMDAyODYzODE0NmZhOTU2ZDRjMjZiZDNlODY4M3AyOTg1NA",
+        ssl: true
+      },
+    ]
+  end
+
+  PUBLIC_SERVERS = load_public_servers
+
   attr_reader :cb_map, :pending_requests,
               :last_publish, :keep_alive,
               :event_loop, :pool, :sub
@@ -170,6 +214,7 @@ class Cluster
       Redis.new()
     end
     @sub = Redis.new()
+    @connected_server = "local"
   end
 
   def _connect_remote(url)
@@ -178,14 +223,59 @@ class Cluster
       Redis.new(url: url)
     end
     @sub = Redis.new(url: url)
+    @connected_server = url
+  end
+
+  def _connect_public()
+    # Try each public server in order until one works
+    PUBLIC_SERVERS.each do |server|
+      begin
+        Log.out("Trying #{server[:name]} (#{server[:host]}:#{server[:port]})...", label: :connect)
+
+        opts = {
+          host: server[:host],
+          port: server[:port],
+          connect_timeout: 3,
+          read_timeout: 3
+        }
+        opts[:password] = server[:password] if server[:password]
+        opts[:ssl] = true if server[:ssl]
+
+        # Test connection first
+        test_conn = Redis.new(**opts)
+        test_conn.ping
+        test_conn.close
+
+        # Connection works, create pool and subscriber
+        @pool = ConnectionPool.new(size: POOL_SIZE, timeout: POOL_TIMEOUT) do
+          Redis.new(**opts)
+        end
+        @sub = Redis.new(**opts)
+        @connected_server = server[:name]
+
+        Log.out("Connected to #{server[:name]}!", label: :connect)
+        return true
+      rescue => e
+        Log.out("#{server[:name]} failed: #{e.message}", label: :connect)
+        next
+      end
+    end
+
+    fail "All public Redis servers unavailable!"
   end
 
   def _connect()
     if (url = Opts.url)
-      _connect_remote(url.split("=").last)
+      _connect_remote(url)
+    elsif Opts.public
+      _connect_public()
     else
       _connect_local()
     end
+  end
+
+  def connected_server
+    @connected_server
   end
 
   def connected
@@ -619,6 +709,10 @@ class Cluster
 
   def self.pool
     @cluster&.pool
+  end
+
+  def self.connected_server
+    @cluster&.connected_server
   end
 end
 
