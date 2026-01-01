@@ -646,6 +646,55 @@ class Bigshot
   end
 end
 
+# ClusterStatusProxy - Wraps cluster request-response with fallbacks
+class Bigshot
+  module ClusterStatusProxy
+    def self.cluster_available?
+      defined?(Cluster) && Cluster.respond_to?(:up?) && Cluster.up?
+    end
+
+    # Query status of a single member
+    def self.query_status(name, timeout: 3)
+      return nil unless cluster_available?
+      response = Cluster.request(name, channel: :bs_status, timeout: timeout)
+      return nil if response.is_a?(Exception) || response.nil?
+      response
+    rescue => e
+      nil
+    end
+
+    # Query status of multiple members in parallel
+    def self.query_all_status(names, timeout: 3)
+      return {} if names.empty?
+      return {} unless cluster_available?
+      responses = Cluster.map(names, channel: :bs_status, timeout: timeout)
+      names.zip(responses).to_h.reject { |_, v| v.nil? || v.is_a?(Exception) }
+    rescue => e
+      {}
+    end
+
+    # Query ready-to-hunt status of multiple members
+    def self.query_ready_to_hunt(names, timeout: 3)
+      return {} if names.empty?
+      return {} unless cluster_available?
+      responses = Cluster.map(names, channel: :bs_ready_to_hunt, timeout: timeout)
+      names.zip(responses).to_h.reject { |_, v| v.nil? || v.is_a?(Exception) }
+    rescue => e
+      {}
+    end
+
+    # Query ready-to-rest status of multiple members
+    def self.query_ready_to_rest(names, timeout: 3)
+      return {} if names.empty?
+      return {} unless cluster_available?
+      responses = Cluster.map(names, channel: :bs_ready_to_rest, timeout: timeout)
+      names.zip(responses).to_h.reject { |_, v| v.nil? || v.is_a?(Exception) }
+    rescue => e
+      {}
+    end
+  end
+end
+
 # Group class for head/tail - now uses Cluster group channels
 class Bigshot
   class Group
@@ -842,9 +891,32 @@ class Bigshot
       end
 
       $bigshot_group_status = {}
-      member_online do |name, member|
-        reason = member.ready_to_hunt?
-        $bigshot_group_status[name] = reason unless reason == "ready"
+
+      # Try cluster request-response first
+      if ClusterStatusProxy.cluster_available? && @members.any?
+        responses = ClusterStatusProxy.query_ready_to_hunt(@members.keys)
+        responses.each do |name, resp|
+          next unless resp
+          $bigshot_group_status[name] = resp.reason unless resp.ready
+        end
+        # Only fall back to DRb for members we didn't get a response from
+        missing = @members.keys - responses.keys
+        missing.each do |name|
+          member = @members[name]
+          next unless member
+          begin
+            reason = member.ready_to_hunt?
+            $bigshot_group_status[name] = reason unless reason == "ready"
+          rescue DRb::DRbConnError
+            # Member offline, skip
+          end
+        end
+      else
+        # Fall back to DRb
+        member_online do |name, member|
+          reason = member.ready_to_hunt?
+          $bigshot_group_status[name] = reason unless reason == "ready"
+        end
       end
 
       $bigshot_group_status.empty? ? ($bigshot_status = :ready; true) : false
@@ -859,9 +931,32 @@ class Bigshot
     def group_should_rest?
       $bigshot_group_status = {}
 
-      member_online do |name, member|
-        if (reason = member.ready_to_rest?)
-          $bigshot_group_status[name] = reason
+      # Try cluster request-response first
+      if ClusterStatusProxy.cluster_available? && @members.any?
+        responses = ClusterStatusProxy.query_ready_to_rest(@members.keys)
+        responses.each do |name, resp|
+          next unless resp
+          $bigshot_group_status[name] = resp.reason if resp.should_rest
+        end
+        # Only fall back to DRb for members we didn't get a response from
+        missing = @members.keys - responses.keys
+        missing.each do |name|
+          member = @members[name]
+          next unless member
+          begin
+            if (reason = member.ready_to_rest?)
+              $bigshot_group_status[name] = reason
+            end
+          rescue DRb::DRbConnError
+            # Member offline, skip
+          end
+        end
+      else
+        # Fall back to DRb
+        member_online do |name, member|
+          if (reason = member.ready_to_rest?)
+            $bigshot_group_status[name] = reason
+          end
         end
       end
 
@@ -878,10 +973,33 @@ class Bigshot
 
     def group_encumbrance
       group_weight = {}
+      encumbered_setting = @leader.ENCUMBERED rescue 90
 
-      member_online do |name, member|
-        current, setting = member.encumbrance?
-        group_weight[name] = (setting - current)
+      # Try cluster request-response first
+      if ClusterStatusProxy.cluster_available? && @members.any?
+        responses = ClusterStatusProxy.query_all_status(@members.keys)
+        responses.each do |name, resp|
+          next unless resp&.encumbrance
+          group_weight[name] = (encumbered_setting - resp.encumbrance)
+        end
+        # Only fall back to DRb for members we didn't get a response from
+        missing = @members.keys - responses.keys
+        missing.each do |name|
+          member = @members[name]
+          next unless member
+          begin
+            current, setting = member.encumbrance?
+            group_weight[name] = (setting - current)
+          rescue DRb::DRbConnError
+            # Member offline, skip
+          end
+        end
+      else
+        # Fall back to DRb
+        member_online do |name, member|
+          current, setting = member.encumbrance?
+          group_weight[name] = (setting - current)
+        end
       end
 
       return group_weight
@@ -1058,6 +1176,7 @@ class Bigshot
         ma_looter: { default: '' },
         never_loot: { default: '' },
         random_loot: { default: false },
+        contract_looting: { default: false },
         final_loot: { default: false },
 
         # Monitoring
@@ -2254,7 +2373,7 @@ class Bigshot
                 :WANDER_WAIT, :QUICK_COMMANDS, :PRIORITY, :TROUBADOURS_RALLY, :SNEAKY_SNEAKY,
                 :QUICKHUNT_TARGETS, :UAC_SMITE, :FOG_RETURN, :FOG_OPTIONAL, :LOOT_STANCE,
                 :DELAY_LOOT, :PULL, :OVERKILL, :LTE_BOOST, :HELP_GROUP_KILL, :WEAPON_REACTION, :DEADER, :CORRECT_PERCENT_MIND, :MA_LOOTER,
-                :GROUP_DEADER, :NEVER_LOOT, :RANDOM_LOOT, :BANDIT_HUNTING, :INDEPENDENT_TRAVEL, :INDEPENDENT_RETURN, :DESIGNATED_LOOTER, :CONTAINERS,
+                :GROUP_DEADER, :NEVER_LOOT, :RANDOM_LOOT, :CONTRACT_LOOTING, :BANDIT_HUNTING, :INDEPENDENT_TRAVEL, :INDEPENDENT_RETURN, :DESIGNATED_LOOTER, :CONTAINERS,
                 :REMAINING_SKINS, :SKIN, :BUNDLE_SKIN, :GEM, :GEM_NUMBER, :TRACKING_CREATURE, :BOUNTY_EVAL, :CHECK_FAVOR,
                 :DEBUG_COMBAT, :DEBUG_COMMANDS, :DEBUG_STATUS, :DEBUG_SYSTEM, :DEBUG_FILE, :debug_logger, :LAST_CALLED, :REST_PREP, :FINAL_LOOT,
                 :COMMAND_AMOUNT_CHECKS, :COMMAND_BUFF_CHECKS, :COMMAND_MODIFIER_REGEX, :COMMAND_AMOUNT_REGEX, :COMMAND_BUFF_REGEX, :DAGGER_REGEX, :BLUNT_REGEX
@@ -2884,6 +3003,7 @@ class Bigshot
       'ma_looter'                   => ['', nil],               # character name of looter
       'never_loot'                  => ['split_xx', Array.new], # no-looting list
       'random_loot'                 => ['', false],             # random looting based on encumbrance
+      'contract_looting'            => ['', false],             # use cluster contracts for dynamic loot assignment
       'final_loot'                  => ['', false],             # option to allow leader final loot before leaving a room
 
       # Monitoring Tab
@@ -6406,19 +6526,52 @@ class Bigshot
       return unless time_between(:need_to_loot?, 15)
     end
 
-    # determine the looter
-    @DESIGNATED_LOOTER = ma_looter
+    # Use contract-based looting if enabled and cluster available
+    if @CONTRACT_LOOTING && ClusterStatusProxy.cluster_available? && defined?(Contracts)
+      debug_msg(@DEBUG_COMBAT, "need_to_loot | using contract-based looting")
 
-    debug_msg(@DEBUG_COMBAT, "need_to_loot | final_loot: #{final_loot} | @DESIGNATED_LOOTER: #{@DESIGNATED_LOOTER}")
+      # Get eligible bidders (followers not in NEVER_LOOT list, plus leader if eligible)
+      valid_bidders = @followers.get_names.reject { |name| @NEVER_LOOT.include?(name) }
+      valid_bidders << Char.name unless @NEVER_LOOT.include?(Char.name)
 
-    $looting_inactive = false
-    if Char.name == @DESIGNATED_LOOTER
-      loot()
-      $looting_inactive = true
+      begin
+        winner = Contracts.collect_bids(:bs_loot_item,
+          valid_bidders: valid_bidders,
+          room_id: Room.current.id
+        )
+
+        if winner
+          debug_msg(@DEBUG_COMBAT, "need_to_loot | contract winner: #{winner}")
+          # Winner's contract_win handler executes loot()
+          # Just wait briefly for the action to complete
+          sleep 0.5
+        else
+          debug_msg(@DEBUG_COMBAT, "need_to_loot | no contract winner, falling back to leader")
+          $looting_inactive = false
+          loot()
+          $looting_inactive = true
+        end
+      rescue => e
+        debug_msg(@DEBUG_COMBAT, "need_to_loot | contract error: #{e.message}, falling back")
+        $looting_inactive = false
+        loot()
+        $looting_inactive = true
+      end
     else
-      @followers.set_group_looting_active
-      @followers.add_event(:PREP_REST)
-      @followers.add_event(:LOOT)
+      # Original static looter logic
+      @DESIGNATED_LOOTER = ma_looter
+
+      debug_msg(@DEBUG_COMBAT, "need_to_loot | final_loot: #{final_loot} | @DESIGNATED_LOOTER: #{@DESIGNATED_LOOTER}")
+
+      $looting_inactive = false
+      if Char.name == @DESIGNATED_LOOTER
+        loot()
+        $looting_inactive = true
+      else
+        @followers.set_group_looting_active
+        @followers.add_event(:PREP_REST)
+        @followers.add_event(:LOOT)
+      end
     end
 
     # update the experience bucket
@@ -7841,6 +7994,11 @@ elsif (Script.current.vars[1] =~ /head|lead/i)
     exit
   end
 
+  # Load bigshot-specific cluster callbacks (same pattern as cluster.lic)
+  class Cluster
+    load("scripts/bigshot_callbacks.rb") if Script.exists?("bigshot_callbacks.rb")
+  end
+
   # Generate group ID and join the cluster group channel
   group_id = SecureRandom.hex(4)
   Cluster.join_group(group_id)
@@ -7971,6 +8129,11 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
   unless cluster_available?
     Lich::Messaging.msg("red", "Cluster is not running. Start with: ;cluster")
     exit
+  end
+
+  # Load bigshot-specific cluster callbacks (same pattern as cluster.lic)
+  class Cluster
+    load("scripts/bigshot_callbacks.rb") if Script.exists?("bigshot_callbacks.rb")
   end
 
   group_id = nil
