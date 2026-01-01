@@ -301,6 +301,25 @@ before_dying do
 end
 ```
 
+#### Group Request/Response
+
+For synchronous request/response within a group (first responder wins):
+
+```ruby
+# Responder registers handler
+Cluster.on_group_request(:status) do |_, req|
+  { health: percenthealth, mana: percentmana, room: Room.current.id }
+end
+
+# Requester asks the group
+response = Cluster.group_request(:status, timeout: 5)
+if response.is_a?(Exception)
+  echo "No response from group"
+else
+  echo "Got status: health=#{response.health}, mana=#{response.mana}"
+end
+```
+
 #### Group Channel Methods
 
 | Method | Description |
@@ -311,6 +330,8 @@ end
 | `Cluster.in_group?` | Returns true if in a group |
 | `Cluster.group_broadcast(ch, **data)` | Send message to group members only |
 | `Cluster.on_group(ch, &block)` | Register handler for group messages |
+| `Cluster.group_request(ch, **data)` | Request/response - returns first response |
+| `Cluster.on_group_request(ch, &block)` | Register handler for group requests |
 
 ---
 
@@ -547,6 +568,8 @@ end
 | `Cluster.leave_group` | Leave current group | `Cluster.leave_group` |
 | `Cluster.group_broadcast` | Send to group only | `Cluster.group_broadcast(:event, data: val)` |
 | `Cluster.on_group` | Handle group messages | `Cluster.on_group(:ch) { \|_, req\| ... }` |
+| `Cluster.group_request` | Group request-response | `Cluster.group_request(:status, timeout: 5)` |
+| `Cluster.on_group_request` | Handle group requests | `Cluster.on_group_request(:ch) { \|_, req\| ... }` |
 | `Cluster.in_group?` | Check if in group | `if Cluster.in_group?` |
 | `Cluster.current_group` | Get group ID | `echo Cluster.current_group` |
 | `Cluster.connected` | Check connection | `if Cluster.connected` |
