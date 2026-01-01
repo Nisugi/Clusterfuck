@@ -140,6 +140,7 @@ end
 class Cluster
   PERSONAL_GS_EVENTS = [%[gs], Char.name.downcase, %[*]].join(".")
   PUBLIC_GS_EVENTS   = [%[gs], %[pub], %[*]].join(".")
+  GROUP_PREFIX       = "gs.grp"
   NOOP               = ->channel, message {}
   UNSUPPORTED_METHOD = ->channel, _message { return { error: "#{channel} is not implemented on #{Char.name}" } }
   TTL                = 5
@@ -202,7 +203,7 @@ class Cluster
   end
 
   def make_group_pattern(group_id)
-    "gs.grp.#{group_id.to_s.downcase}.*"
+    "#{GROUP_PREFIX}.#{group_id.to_s.downcase}.*"
   end
 
   def publish(*args)
@@ -391,7 +392,7 @@ class Cluster
   def group_broadcast(channel, group_id: nil, **payload)
     gid = group_id || current_group
     fail "Not in a group. Call join_group first or pass group_id:" unless gid
-    target_channel = "gs.grp.#{gid.to_s.downcase}.#{channel}"
+    target_channel = "#{GROUP_PREFIX}.#{gid.to_s.downcase}.#{channel}"
     publish(target_channel, payload.merge({ from: Char.name }).to_json)
   end
 
@@ -399,7 +400,36 @@ class Cluster
     fail "no block given to Cluster#on_group" unless block_given?
     gid = group_id || current_group
     fail "Not in a group" unless gid
-    @cb_map["gs.grp.#{gid.to_s.downcase}.#{channel}"] = block
+    @cb_map["#{GROUP_PREFIX}.#{gid.to_s.downcase}.#{channel}"] = block
+    self
+  end
+
+  # Request/response within a group - returns first response from any member
+  def group_request(channel, group_id: nil, **payload)
+    gid = group_id || current_group
+    fail "Not in a group. Call join_group first or pass group_id:" unless gid
+    req_id = SecureRandom.hex(10)
+    target_channel = "#{GROUP_PREFIX}.#{gid.to_s.downcase}.#{channel}.request"
+    publish(target_channel, payload.merge({ from: Char.name, uuid: req_id }).to_json)
+
+    ttl = payload.fetch(:timeout, TTL)
+    @pending_requests[req_id] = Thread.current
+    timeout_thread = Thread.new { sleep ttl; @pending_requests[req_id]&.wakeup }
+    Thread.stop
+
+    timeout_thread.kill
+    resp = pending_requests[req_id]
+    pending_requests.delete(req_id)
+    return TimeoutError.new("group_request timed out after #{ttl}s") if resp.is_a?(Thread)
+    return Exception.new(resp.fetch(:error)) if resp.is_a?(Hash) && resp.fetch(:error, false)
+    return OpenStruct.new(resp)
+  end
+
+  def on_group_request(channel, group_id: nil, &block)
+    fail "no block given to Cluster#on_group_request" unless block_given?
+    gid = group_id || current_group
+    fail "Not in a group" unless gid
+    @cb_map["#{GROUP_PREFIX}.#{gid.to_s.downcase}.#{channel}.request"] = block
     self
   end
 
@@ -499,6 +529,16 @@ class Cluster
   def self.on_group(channel, &block)
     init
     @cluster.on_group(channel, &block)
+  end
+
+  def self.group_request(channel, **kwargs)
+    init
+    @cluster.group_request(channel, **kwargs)
+  end
+
+  def self.on_group_request(channel, &block)
+    init
+    @cluster.on_group_request(channel, &block)
   end
 
   def self.current_group
