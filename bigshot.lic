@@ -653,13 +653,30 @@ class Bigshot
       defined?(Cluster) && Cluster.respond_to?(:up?) && Cluster.up?
     end
 
+    def self.debug(msg)
+      return unless $bigshot_debug && $bigshot&.DEBUG_CLUSTER
+
+      full_msg = "[cluster] #{msg}"
+      if $bigshot.DEBUG_FILE && $bigshot.debug_logger
+        $bigshot.debug_logger.log(full_msg)
+      else
+        echo full_msg
+      end
+    end
+
     # Query status of a single member
     def self.query_status(name, timeout: 3)
       return nil unless cluster_available?
+      debug("send :bs_status to #{name}")
       response = Cluster.request(name, channel: :bs_status, timeout: timeout)
-      return nil if response.is_a?(Exception) || response.nil?
+      if response.is_a?(Exception) || response.nil?
+        debug("recv :bs_status from #{name} → FAILED")
+        return nil
+      end
+      debug("recv :bs_status from #{name} → h:#{response[:health]} m:#{response[:mana]} e:#{response[:encumbrance]} r:#{response[:room]}")
       response
     rescue => e
+      debug("recv :bs_status from #{name} → ERROR: #{e.message}")
       nil
     end
 
@@ -667,9 +684,15 @@ class Bigshot
     def self.query_all_status(names, timeout: 3)
       return {} if names.empty?
       return {} unless cluster_available?
+      debug("send :bs_status to [#{names.join(', ')}]")
       responses = Cluster.map(names, channel: :bs_status, timeout: timeout)
-      names.zip(responses).to_h.reject { |_, v| v.nil? || v.is_a?(Exception) }
+      result = names.zip(responses).to_h.reject { |_, v| v.nil? || v.is_a?(Exception) }
+      result.each do |name, resp|
+        debug("recv :bs_status from #{name} → h:#{resp[:health]} m:#{resp[:mana]} e:#{resp[:encumbrance]} r:#{resp[:room]}")
+      end
+      result
     rescue => e
+      debug("recv :bs_status → ERROR: #{e.message}")
       {}
     end
 
@@ -677,9 +700,15 @@ class Bigshot
     def self.query_ready_to_hunt(names, timeout: 3)
       return {} if names.empty?
       return {} unless cluster_available?
+      debug("send :bs_ready_to_hunt to [#{names.join(', ')}]")
       responses = Cluster.map(names, channel: :bs_ready_to_hunt, timeout: timeout)
-      names.zip(responses).to_h.reject { |_, v| v.nil? || v.is_a?(Exception) }
+      result = names.zip(responses).to_h.reject { |_, v| v.nil? || v.is_a?(Exception) }
+      result.each do |name, resp|
+        debug("recv :bs_ready_to_hunt from #{name} → ready:#{resp[:ready]} reason:#{resp[:reason]}")
+      end
+      result
     rescue => e
+      debug("recv :bs_ready_to_hunt → ERROR: #{e.message}")
       {}
     end
 
@@ -687,9 +716,15 @@ class Bigshot
     def self.query_ready_to_rest(names, timeout: 3)
       return {} if names.empty?
       return {} unless cluster_available?
+      debug("send :bs_ready_to_rest to [#{names.join(', ')}]")
       responses = Cluster.map(names, channel: :bs_ready_to_rest, timeout: timeout)
-      names.zip(responses).to_h.reject { |_, v| v.nil? || v.is_a?(Exception) }
+      result = names.zip(responses).to_h.reject { |_, v| v.nil? || v.is_a?(Exception) }
+      result.each do |name, resp|
+        debug("recv :bs_ready_to_rest from #{name} → should_rest:#{resp[:should_rest]} reason:#{resp[:reason]}")
+      end
+      result
     rescue => e
+      debug("recv :bs_ready_to_rest → ERROR: #{e.message}")
       {}
     end
   end
@@ -698,7 +733,7 @@ end
 # Group class for head/tail - now uses Cluster group channels
 class Bigshot
   class Group
-    attr_accessor :leader, :members, :group_id, :leader_target_id
+    attr_accessor :leader, :members, :group_id, :leader_target_id, :leader_room_id
 
     def initialize(group_id = nil)
       @members = Hash.new
@@ -742,6 +777,10 @@ class Bigshot
       @leader_target_id = target_id
     end
 
+    def set_leader_room(room_id)
+      @leader_room_id = room_id
+    end
+
     def add_member(member)
       @members[member.name] = member
     end
@@ -759,7 +798,12 @@ class Bigshot
     end
 
     def room_id
-      return @leader.room_id
+      # In cluster mode, use the tracked room ID from broadcasts
+      if @leader_room_id && defined?(Cluster) && Cluster.respond_to?(:in_group?) && Cluster.in_group?
+        return @leader_room_id
+      end
+      # Fall back to local room (works for leader)
+      @leader.room_id
     end
 
     def leader_claim?(**kwargs)
@@ -771,15 +815,16 @@ class Bigshot
     end
 
     def looting_done
-      member_online do |_, member|
-        return false if !member.looting_inactive?
-      end
+      # Use cluster to check if all members are done looting
+      return true unless ClusterStatusProxy.cluster_available? && @members.any?
 
-      return true
+      responses = ClusterStatusProxy.query_all_status(@members.keys)
+      responses.all? { |_, resp| resp && resp[:looting_inactive] }
     end
 
     def set_group_looting_active
-      @members[@leader.designated_looter].set_looting_active
+      # In cluster mode, looting is handled by the contract winner
+      # No need to set state on remote members
     end
 
     def looter
@@ -795,6 +840,9 @@ class Bigshot
           current_target = GameObj.target
           target_id = current_target.id if current_target && current_target.status !~ /dead|gone/
         end
+
+        @leader.debug_msg(@leader.DEBUG_CLUSTER, "[SEND] Event: #{type} | room: #{room} | target: #{target_id} | data: #{data.inspect}")
+
         Cluster.group_broadcast(:event,
           type: type.to_s,
           timestamp: Time.now.to_i,
@@ -825,9 +873,8 @@ class Bigshot
     end
 
     def group_assist(should_attack)
-      member_online do |_, member|
-        member.set_help_group(should_attack)
-      end
+      # In cluster mode, assist is handled via events
+      # TODO: Add cluster broadcast for assist state if needed
     end
 
     def add_leader_event(event)
@@ -851,11 +898,11 @@ class Bigshot
     end
 
     def roundtime?
-      member_online do |_, member|
-        return true if member.rt? > 0
-      end
+      # Use cluster to check if any member has roundtime
+      return false unless ClusterStatusProxy.cluster_available? && @members.any?
 
-      return false
+      responses = ClusterStatusProxy.query_all_status(@members.keys)
+      responses.any? { |_, resp| resp && resp[:roundtime].to_i > 0 }
     end
 
     # Use this to perform combat actions
@@ -879,9 +926,8 @@ class Bigshot
     end
 
     def clear_group_events()
-      member_online do |_, member|
-        member.clear_events()
-      end
+      # In cluster mode, each member clears their own events locally
+      # No need to call across via DRb
     end
 
     def group_should_hunt?
@@ -892,132 +938,97 @@ class Bigshot
 
       $bigshot_group_status = {}
 
-      # Try cluster request-response first
-      if ClusterStatusProxy.cluster_available? && @members.any?
+      # Check push-based cache first (instant, no network)
+      if $bigshot_follower_cache && @members.any?
+        @members.keys.each do |name|
+          status = $bigshot_follower_cache[name]
+          next unless status
+          $bigshot_group_status[name] = status[:rest_reason] unless status[:ready_to_hunt]
+        end
+        @leader.debug_msg(@leader.DEBUG_CLUSTER, "group_should_hunt? | cache=#{$bigshot_group_status.inspect}")
+      # Fallback to request-response if cache empty
+      elsif ClusterStatusProxy.cluster_available? && @members.any?
+        @leader.debug_msg(@leader.DEBUG_CLUSTER, "group_should_hunt? | querying #{@members.keys.inspect} (cache miss)")
         responses = ClusterStatusProxy.query_ready_to_hunt(@members.keys)
         responses.each do |name, resp|
           next unless resp
-          $bigshot_group_status[name] = resp.reason unless resp.ready
+          $bigshot_group_status[name] = resp[:reason] unless resp[:ready]
         end
-        # Only fall back to DRb for members we didn't get a response from
-        missing = @members.keys - responses.keys
-        missing.each do |name|
-          member = @members[name]
-          next unless member
-          begin
-            reason = member.ready_to_hunt?
-            $bigshot_group_status[name] = reason unless reason == "ready"
-          rescue DRb::DRbConnError
-            # Member offline, skip
-          end
-        end
-      else
-        # Fall back to DRb
-        member_online do |name, member|
-          reason = member.ready_to_hunt?
-          $bigshot_group_status[name] = reason unless reason == "ready"
-        end
+        @leader.debug_msg(@leader.DEBUG_CLUSTER, "group_should_hunt? | status=#{$bigshot_group_status.inspect}")
       end
 
       $bigshot_group_status.empty? ? ($bigshot_status = :ready; true) : false
     end
 
     def group_bandit_hunting(kill_bandits)
-      member_online do |_, member|
-        member.set_bandit_hunting(kill_bandits)
-      end
+      # In cluster mode, bandit hunting state is set locally on each member
+      # TODO: Add cluster broadcast for bandit hunting state if needed
     end
 
     def group_should_rest?
       $bigshot_group_status = {}
 
-      # Try cluster request-response first
-      if ClusterStatusProxy.cluster_available? && @members.any?
+      # Check push-based cache first (instant, no network)
+      if $bigshot_follower_cache && @members.any?
+        @members.keys.each do |name|
+          status = $bigshot_follower_cache[name]
+          next unless status
+          $bigshot_group_status[name] = status[:rest_reason] if status[:should_rest]
+        end
+        @leader.debug_msg(@leader.DEBUG_CLUSTER, "group_should_rest? | cache=#{$bigshot_group_status.inspect}")
+      # Fallback to request-response if cache empty
+      elsif ClusterStatusProxy.cluster_available? && @members.any?
+        @leader.debug_msg(@leader.DEBUG_CLUSTER, "group_should_rest? | querying #{@members.keys.inspect} (cache miss)")
         responses = ClusterStatusProxy.query_ready_to_rest(@members.keys)
         responses.each do |name, resp|
           next unless resp
-          $bigshot_group_status[name] = resp.reason if resp.should_rest
+          $bigshot_group_status[name] = resp[:reason] if resp[:should_rest]
         end
-        # Only fall back to DRb for members we didn't get a response from
-        missing = @members.keys - responses.keys
-        missing.each do |name|
-          member = @members[name]
-          next unless member
-          begin
-            if (reason = member.ready_to_rest?)
-              $bigshot_group_status[name] = reason
-            end
-          rescue DRb::DRbConnError
-            # Member offline, skip
-          end
-        end
-      else
-        # Fall back to DRb
-        member_online do |name, member|
-          if (reason = member.ready_to_rest?)
-            $bigshot_group_status[name] = reason
-          end
-        end
+        @leader.debug_msg(@leader.DEBUG_CLUSTER, "group_should_rest? | status=#{$bigshot_group_status.inspect}")
       end
 
       return !$bigshot_group_status.empty?
     end
 
     def any_saturated?
-      member_online do |_, member|
-        return true if member.saturated?
-      end
+      # Use cluster to check if any member is saturated
+      return false unless ClusterStatusProxy.cluster_available? && @members.any?
 
-      return false
+      responses = ClusterStatusProxy.query_all_status(@members.keys)
+      responses.any? { |_, resp| resp && resp[:saturated] }
     end
 
     def group_encumbrance
       group_weight = {}
       encumbered_setting = @leader.ENCUMBERED rescue 90
 
-      # Try cluster request-response first
+      # Use cluster request-response
       if ClusterStatusProxy.cluster_available? && @members.any?
+        @leader.debug_msg(@leader.DEBUG_CLUSTER, "group_encumbrance | querying #{@members.keys.inspect}")
         responses = ClusterStatusProxy.query_all_status(@members.keys)
         responses.each do |name, resp|
-          next unless resp&.encumbrance
-          group_weight[name] = (encumbered_setting - resp.encumbrance)
+          next unless resp && resp[:encumbrance]
+          group_weight[name] = (encumbered_setting - resp[:encumbrance])
         end
-        # Only fall back to DRb for members we didn't get a response from
-        missing = @members.keys - responses.keys
-        missing.each do |name|
-          member = @members[name]
-          next unless member
-          begin
-            current, setting = member.encumbrance?
-            group_weight[name] = (setting - current)
-          rescue DRb::DRbConnError
-            # Member offline, skip
-          end
-        end
-      else
-        # Fall back to DRb
-        member_online do |name, member|
-          current, setting = member.encumbrance?
-          group_weight[name] = (setting - current)
-        end
+        @leader.debug_msg(@leader.DEBUG_CLUSTER, "group_encumbrance | weights=#{group_weight.inspect}")
       end
 
       return group_weight
     end
 
     def need_sneaky?
-      member_online do |_, member|
-        return true if member.sneaky_hunt? && !member.player_hidden?
-      end
+      # Use cluster to check if any member needs to be sneaky but isn't hidden
+      return false unless ClusterStatusProxy.cluster_available? && @members.any?
 
-      return false
+      responses = ClusterStatusProxy.query_all_status(@members.keys)
+      responses.any? { |_, resp| resp && resp[:sneaky_hunt] && !resp[:player_hidden] }
     end
 
     def all_present?
       sleep(0.1) while Lich::Gemstone::Claim::Lock.locked?
 
-      member_online do |name, member|
-        member.ping
+      # In cluster mode, check if all members are in the room via game data
+      @members.keys.each do |name|
         return false unless checkpcs.include?(name)
         return false unless Lich::Gemstone::Group.members.map(&:noun).include?(name)
       end
@@ -1026,19 +1037,19 @@ class Bigshot
     end
 
     def rest_prep_complete?
-      member_online do |_, member|
-        return false if !member.rest_prep_done?
-      end
+      # Use cluster to check if all members are done with rest prep
+      return true unless ClusterStatusProxy.cluster_available? && @members.any?
 
-      return true
+      responses = ClusterStatusProxy.query_all_status(@members.keys)
+      responses.all? { |_, resp| resp && resp[:rest_prep_done] }
     end
 
     def emergency_rest?
-      member_online do |_, member|
-        return true if member.wounded?
-      end
+      # Use cluster to check if any member is wounded
+      return false unless ClusterStatusProxy.cluster_available? && @members.any?
 
-      return false
+      responses = ClusterStatusProxy.query_all_status(@members.keys)
+      responses.any? { |_, resp| resp && resp[:wounded] }
     end
   end
 end
@@ -2375,7 +2386,7 @@ class Bigshot
                 :DELAY_LOOT, :PULL, :OVERKILL, :LTE_BOOST, :HELP_GROUP_KILL, :WEAPON_REACTION, :DEADER, :CORRECT_PERCENT_MIND, :MA_LOOTER,
                 :GROUP_DEADER, :NEVER_LOOT, :RANDOM_LOOT, :CONTRACT_LOOTING, :BANDIT_HUNTING, :INDEPENDENT_TRAVEL, :INDEPENDENT_RETURN, :DESIGNATED_LOOTER, :CONTAINERS,
                 :REMAINING_SKINS, :SKIN, :BUNDLE_SKIN, :GEM, :GEM_NUMBER, :TRACKING_CREATURE, :BOUNTY_EVAL, :CHECK_FAVOR,
-                :DEBUG_COMBAT, :DEBUG_COMMANDS, :DEBUG_STATUS, :DEBUG_SYSTEM, :DEBUG_FILE, :debug_logger, :LAST_CALLED, :REST_PREP, :FINAL_LOOT,
+                :DEBUG_COMBAT, :DEBUG_COMMANDS, :DEBUG_STATUS, :DEBUG_SYSTEM, :DEBUG_CLUSTER, :DEBUG_FILE, :debug_logger, :LAST_CALLED, :REST_PREP, :FINAL_LOOT,
                 :COMMAND_AMOUNT_CHECKS, :COMMAND_BUFF_CHECKS, :COMMAND_MODIFIER_REGEX, :COMMAND_AMOUNT_REGEX, :COMMAND_BUFF_REGEX, :DAGGER_REGEX, :BLUNT_REGEX
 
   PRONE ||= /sleeping|webbed|stunned|kneeling|sitting|^lying|prone|frozen|held in place|entangled/
@@ -2568,6 +2579,8 @@ class Bigshot
       respond ""
       respond " #{$lich_char}#{Script.current.name} debug system <true/false>       System processes"
       respond ""
+      respond " #{$lich_char}#{Script.current.name} debug cluster <true/false>      Cluster request/response messaging"
+      respond ""
       respond " Options can be combined:"
       respond "         #{$lich_char}#{Script.current.name} debug combat commands status <true/false>"
       respond ""
@@ -2577,7 +2590,7 @@ class Bigshot
   end
 
   def self.debug_update(updates)
-    categories = ['debug_combat', 'debug_commands', 'debug_status', 'debug_system', 'debug_file']
+    categories = ['debug_combat', 'debug_commands', 'debug_status', 'debug_system', 'debug_cluster', 'debug_file']
     debug_array = updates.split(/[\s,|]+/)
     debug_array.shift
 
@@ -2755,13 +2768,14 @@ class Bigshot
     @DEBUG_COMMANDS   = CharSettings['debug_commands']
     @DEBUG_STATUS     = CharSettings['debug_status']
     @DEBUG_SYSTEM     = CharSettings['debug_system']
+    @DEBUG_CLUSTER    = CharSettings['debug_cluster']
     @DEBUG_FILE       = CharSettings['debug_file']
 
     if @DEBUG_FILE
       @debug_logger = DebugLogger.new
     end
 
-    if [@DEBUG_COMBAT, @DEBUG_COMMANDS, @DEBUG_STATUS, @DEBUG_SYSTEM].any?(&:itself)
+    if [@DEBUG_COMBAT, @DEBUG_COMMANDS, @DEBUG_STATUS, @DEBUG_SYSTEM, @DEBUG_CLUSTER].any?(&:itself)
       echo "debug active for bigshot version #{$bigshot_version}"
       $bigshot_debug = true
     end
@@ -6008,7 +6022,7 @@ class Bigshot
           groupcheck()
           sleep(0.25)
         end
-        @followers.add_event(:GO2_RALLY_ROOM)
+        @followers.add_event(:GO2_RALLY_ROOM, Room.current.id, @RALLYPOINT_ROOM_IDS)
         @RALLYPOINT_ROOM_IDS.each { |room| go2(room.to_i) }
       else
         @RALLYPOINT_ROOM_IDS.each { |room|
@@ -6044,7 +6058,7 @@ class Bigshot
     end
 
     if !$bigshot_quick && !manually_walking
-      @followers.add_event(:GO2_HUNTING_ROOM) if @INDEPENDENT_TRAVEL
+      @followers.add_event(:GO2_HUNTING_ROOM, Room.current.id, @HUNTING_ROOM_ID) if @INDEPENDENT_TRAVEL
       goto(@HUNTING_ROOM_ID)
     end
     # set autosneak on if we're sneaking
@@ -6222,8 +6236,8 @@ class Bigshot
         @followers.add_event(:PREP_REST)
         @followers.add_event(:LEAVE_GROUP)
         @followers.add_event(:FOG_RETURN)
-        @followers.add_event(:GO2_WAYPOINTS)
-        @followers.add_event(:GO2_RESTING_ROOM)
+        @followers.add_event(:GO2_WAYPOINTS, Room.current.id, @RETURN_WAYPOINT_IDS)
+        @followers.add_event(:GO2_RESTING_ROOM, Room.current.id, @RESTING_ROOM_ID)
 
         Lich::Util.quiet_command_xml("disband group", /You have no group to disband|You disband your group/)
         until Lich::Gemstone::Group.empty?
@@ -6534,6 +6548,8 @@ class Bigshot
       valid_bidders = @followers.get_names.reject { |name| @NEVER_LOOT.include?(name) }
       valid_bidders << Char.name unless @NEVER_LOOT.include?(Char.name)
 
+      ClusterStatusProxy.debug("send contract :bs_loot_item to [#{valid_bidders.join(', ')}]")
+
       begin
         winner = Contracts.collect_bids(:bs_loot_item,
           valid_bidders: valid_bidders,
@@ -6541,17 +6557,20 @@ class Bigshot
         )
 
         if winner
+          ClusterStatusProxy.debug("recv contract :bs_loot_item winner → #{winner}")
           debug_msg(@DEBUG_COMBAT, "need_to_loot | contract winner: #{winner}")
           # Winner's contract_win handler executes loot()
           # Just wait briefly for the action to complete
           sleep 0.5
         else
+          ClusterStatusProxy.debug("recv contract :bs_loot_item → no winner")
           debug_msg(@DEBUG_COMBAT, "need_to_loot | no contract winner, falling back to leader")
           $looting_inactive = false
           loot()
           $looting_inactive = true
         end
       rescue => e
+        ClusterStatusProxy.debug("recv contract :bs_loot_item → ERROR: #{e.message}")
         debug_msg(@DEBUG_COMBAT, "need_to_loot | contract error: #{e.message}, falling back")
         $looting_inactive = false
         loot()
@@ -6570,7 +6589,7 @@ class Bigshot
       else
         @followers.set_group_looting_active
         @followers.add_event(:PREP_REST)
-        @followers.add_event(:LOOT)
+        @followers.add_event(:LOOT, Room.current.id, @DESIGNATED_LOOTER)
       end
     end
 
@@ -7595,7 +7614,7 @@ class Bigshot
       end
 
       unless @inbounds.valid?
-        @followers.add_event(:GO2_HUNTING_ROOM)
+        @followers.add_event(:GO2_HUNTING_ROOM, Room.current.id, @HUNTING_ROOM_ID)
         goto(@HUNTING_ROOM_ID)
 
         @followers.add_event(:FOLLOW_NOW)
@@ -8013,6 +8032,9 @@ elsif (Script.current.vars[1] =~ /head|lead/i)
   my_group = Bigshot::Group.new(group_id)
   cluster_members = {}
 
+  # Initialize follower status cache for push-based status updates
+  $bigshot_follower_cache = {}
+
   # Register handler for follower join requests
   Cluster.on_group(:join_request) do |_, req|
     unless cluster_members[req.from]
@@ -8030,6 +8052,12 @@ elsif (Script.current.vars[1] =~ /head|lead/i)
   end
 
   bs = Bigshot.new(Script.current.vars)
+
+  # Register handler for pushed status updates from followers
+  Cluster.on_cast(:bs_status_push) do |_, req|
+    $bigshot_follower_cache[req.from] = req.status
+    bs.debug_msg(bs.DEBUG_CLUSTER, "[RECV] status_push from #{req.from} → rest:#{req.status[:should_rest]} hunt:#{req.status[:ready_to_hunt]}")
+  end
 
   # Announce group ID (subscription should be active now)
   Lich::Messaging.msg("cyan", "=" * 50)
@@ -8118,6 +8146,13 @@ elsif (Script.current.vars[1] =~ /head|lead/i)
   Lich::Messaging.msg("text", " In-game Group Members: #{current_count}")
   Lich::Messaging.msg("text", " Cluster Members: #{cluster_members.keys.join(', ')}") if cluster_members.any?
   respond
+
+  # Transfer cluster members to group.members for cluster request-response
+  # We store just the names - the Group methods will use cluster to communicate
+  cluster_members.each do |name, info|
+    my_group.members[name] = info
+  end
+
   Lich::Messaging.msg("text", " Leaving in...")
   3.downto(1) { |num| Lich::Messaging.msg("text", "     #{num}"); sleep 1 }
   respond
@@ -8192,6 +8227,32 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
 
   leader_name = nil  # Track the leader's character name for group_all_followers
 
+  # Push-Based Status - Track and push status changes to leader
+  $bs_prev_status = {}
+
+  bs_check_status_change = lambda do
+    return unless bs && bs.leader  # Need leader name to push to
+
+    current = {
+      ready_to_hunt: bs.ready_to_hunt? == "ready",
+      should_rest: !!bs.ready_to_rest?,
+      rest_reason: bs.ready_to_rest?,
+      health: percenthealth,
+      mana: percentmana,
+      encumbrance: Char.percent_encumbrance,
+      wounded: bs.wounded? || false,
+      stunned: stunned?,
+      room: Room.current.id
+    }
+
+    # Only push if status changed
+    if current != $bs_prev_status
+      bs.debug_msg(bs.DEBUG_CLUSTER, "[SEND] status_push to #{bs.leader} → rest:#{current[:should_rest]} hunt:#{current[:ready_to_hunt]}")
+      Cluster.cast(bs.leader, channel: :bs_status_push, status: current)
+      $bs_prev_status = current.dup
+    end
+  end
+
   # Register event handlers for group messages
   Cluster.on_group(:event) do |_, req|
     next if req.from == Char.name  # Skip own events
@@ -8201,12 +8262,19 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
     if leader_name.nil?
       leader_name = req.from
       bs.leader = leader_name
+      # Push initial status to leader immediately
+      bs_check_status_change.call
     end
 
     event_type = req.type.to_s.upcase.to_sym rescue :UNKNOWN
     timestamp = req.timestamp || Time.now.to_i
     room_id = req.room_id || Room.current.id
     data = req.data
+
+    bs.debug_msg(bs.DEBUG_CLUSTER, "[RECV] Event: #{event_type} | from: #{req.from} | room: #{room_id} | target: #{req.target_id} | data: #{data.inspect}")
+
+    # Track leader's room from all events
+    group.set_leader_room(room_id)
 
     # Track leader's target for ATTACK events
     if event_type == :ATTACK && req.target_id
@@ -8218,6 +8286,9 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
 
   Cluster.on_group(:command) do |_, req|
     next if req.from == Char.name
+
+    bs.debug_msg(bs.DEBUG_CLUSTER, "[RECV] Command: #{req.cmd} | from: #{req.from} | message: #{req.message}")
+
     case req.cmd.to_s
     when 'do_client', 'CUSTOM_DO_CLIENT'
       do_client(req.message)
@@ -8270,6 +8341,7 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
       # grab event
       event = bs.grab_event
       unless event
+        bs_check_status_change.call  # Push status to leader if changed
         sleep(0.1)
         next
       end
@@ -8291,13 +8363,15 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
       elsif (event.type == :CHECK_SNEAKY)
         bs.cmd_hide(1) if bs.sneaky_hunt? && !hidden
       elsif (event.type == :GO2_RALLY_ROOM)
-        rally_rooms = group.rally_ids
+        rally_rooms = event.cmd_input || group.rally_ids
+        rally_rooms = [rally_rooms] unless rally_rooms.is_a?(Array)
         rally_rooms.each do |place|
           bs.go2(place) until (Room.current.id == place.to_i)
         end
       elsif (event.type == :GO2_HUNTING_ROOM)
-        until (Room.current.id == group.hunting_id)
-          bs.go2(group.hunting_id)
+        target_room = event.cmd_input || group.hunting_id
+        until (Room.current.id == target_room)
+          bs.go2(target_room)
         end
       elsif (event.type == :SINGLE_STOP)
         bs.message("yellow", " Stopping: Bigshot set to single loop")
@@ -8325,7 +8399,7 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
         # Scan for targets until leader says to move or loot
         loop do
           # Break loop if moving or looting
-          break if bs.event_stack.any? { |a| [:PREP_REST, :FOLLOW_NOW].include?(a.type) || (a.type == :LOOT && group.looter == Char.name) }
+          break if bs.event_stack.any? { |a| [:PREP_REST, :FOLLOW_NOW].include?(a.type) || (a.type == :LOOT && a.cmd_input == Char.name) }
 
           # Make sure follower is joined
           bs.group_all_followers
@@ -8363,15 +8437,17 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
       elsif (event.type == :FOG_RETURN)
         bs.fog_return
       elsif (event.type == :GO2_WAYPOINTS)
-        waypoint_rooms = group.return_waypoints_ids
+        waypoint_rooms = event.cmd_input || group.return_waypoints_ids
+        waypoint_rooms = [waypoint_rooms] unless waypoint_rooms.is_a?(Array)
         waypoint_rooms.each do |place|
           bs.go2(place) until (Room.current.id == place.to_i)
         end
       elsif (event.type == :GO2_RESTING_ROOM)
-        until (Room.current.id == group.resting_id)
-          bs.go2(group.resting_id)
+        target_room = event.cmd_input || group.resting_id
+        until (Room.current.id == target_room)
+          bs.go2(target_room)
         end
-      elsif (event.type == :LOOT) && group.looter == Char.name
+      elsif (event.type == :LOOT) && event.cmd_input == Char.name
         $looting_inactive = false
         bs.loot
         bs.wait_rt
