@@ -31,6 +31,7 @@ require 'drb/drb'
 require 'json'
 require 'ostruct'
 require 'securerandom'
+require 'timeout'
 
 class Cluster
   # === Logging ===
@@ -445,11 +446,18 @@ class Cluster
 
   def destroy
     Log.out("Cleaning up...", label: :destroy)
-    broadcast(:leave)
-    group_broadcast(:leave) if in_group? rescue nil
-    @broker.unregister_client(Char.name)
     @heartbeat_thread&.kill
-    DRb.stop_service
+
+    # Quick timeout - broker will clean up stale clients anyway
+    Timeout.timeout(0.1) do
+      broadcast(:leave) rescue nil
+      group_broadcast(:leave) if in_group? rescue nil
+      @broker.unregister_client(Char.name) rescue nil
+    end
+  rescue Timeout::Error
+    Log.out("Cleanup timed out, forcing exit", label: :destroy)
+  ensure
+    DRb.stop_service rescue nil
   end
 
   # === Class Methods (Singleton Pattern) ===
