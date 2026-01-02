@@ -91,6 +91,11 @@ class Cluster
 
   # === Constants ===
   TTL = 5
+
+  def self.game_prefix
+    @game_prefix ||= (XMLData.game == 'GSIV' ? 'gs' : XMLData.game.downcase)
+  end
+
   NOOP = ->(_channel, _message) {}
   UNSUPPORTED_METHOD = ->(_channel, _message) { { error: "Method not implemented on #{Char.name}" } }
 
@@ -214,12 +219,12 @@ class Cluster
     # Build the channel key based on type
     channel_key = case type
     when :broadcast
-      "gs.pub.#{channel}".downcase
+      "#{Cluster.game_prefix}.pub.#{channel}".downcase
     when :cast
-      "gs.#{Char.name}.#{channel}".downcase
+      "#{Cluster.game_prefix}.#{Char.name}.#{channel}".downcase
     when :group_broadcast
       group_id = current_group
-      "gs.grp.#{group_id}.#{channel}".downcase if group_id
+      "#{Cluster.game_prefix}.grp.#{group_id}.#{channel}".downcase if group_id
     else
       nil
     end
@@ -242,13 +247,13 @@ class Cluster
     @connected[from] = Time.now
 
     # Try personal request channel first, then group request
-    channel_key = "gs.#{Char.name}.#{channel}.request".downcase
+    channel_key = "#{Cluster.game_prefix}.#{Char.name}.#{channel}.request".downcase
     callback = @cb_map[channel_key]
 
     unless callback
       group_id = current_group
       if group_id
-        channel_key = "gs.grp.#{group_id}.#{channel}.request".downcase
+        channel_key = "#{Cluster.game_prefix}.grp.#{group_id}.#{channel}.request".downcase
         callback = @cb_map[channel_key]
       end
     end
@@ -331,19 +336,19 @@ class Cluster
 
   def on_broadcast(channel, &block)
     fail "No block given to on_broadcast" unless block_given?
-    @cb_map["gs.pub.#{channel}".downcase] = block
+    @cb_map["#{Cluster.game_prefix}.pub.#{channel}".downcase] = block
     self
   end
 
   def on_cast(channel, &block)
     fail "No block given to on_cast" unless block_given?
-    @cb_map["gs.#{Char.name}.#{channel}".downcase] = block
+    @cb_map["#{Cluster.game_prefix}.#{Char.name}.#{channel}".downcase] = block
     self
   end
 
   def on_request(channel, &block)
     fail "No block given to on_request" unless block_given?
-    @cb_map["gs.#{Char.name}.#{channel}.request".downcase] = block
+    @cb_map["#{Cluster.game_prefix}.#{Char.name}.#{channel}.request".downcase] = block
     self
   end
 
@@ -383,7 +388,7 @@ class Cluster
     fail "No block given to on_group" unless block_given?
     gid = group_id || current_group
     fail "Not in a group" unless gid
-    @cb_map["gs.grp.#{gid}.#{channel}".downcase] = block
+    @cb_map["#{Cluster.game_prefix}.grp.#{gid}.#{channel}".downcase] = block
     self
   end
 
@@ -422,7 +427,7 @@ class Cluster
     fail "No block given to on_group_request" unless block_given?
     gid = group_id || current_group
     fail "Not in a group" unless gid
-    @cb_map["gs.grp.#{gid}.#{channel}.request".downcase] = block
+    @cb_map["#{Cluster.game_prefix}.grp.#{gid}.#{channel}.request".downcase] = block
     self
   end
 
@@ -639,8 +644,8 @@ Cluster.init(opts.port)
 _respond "Cluster (DRb) connected as #{Char.name}"
 
 # Load user callbacks if they exist
-if Script.exists?("drbcluster_callbacks.rb")
-  load("scripts/drbcluster_callbacks.rb")
+if Script.exists?("cluster_callbacks.rb")
+  load("scripts/cluster_callbacks.rb")
 end
 
 # Keep alive
