@@ -1,0 +1,647 @@
+=begin
+  DRb Cluster - Distributed Ruby Cluster Client
+
+  This script provides the same API as cluster.lic but uses DRb instead of Redis.
+  Start drbcluster_broker first, then run this on each character.
+
+  Usage:
+    ;drbcluster              # Connect to broker on default port 8787
+    ;drbcluster --port=9000  # Connect to custom port
+    ;drbcluster --debug      # Enable debug logging
+
+  API Examples:
+    Cluster.on_broadcast(:dead) do |_, req|
+      Log.out("#{req.from} is dead")
+    end
+
+    Cluster.on_request(:roundtime) do |_, req|
+      { hard: checkrt, soft: checkcastrt }
+    end
+
+    Cluster.on_cast(:go2) do |_, req|
+      req.room.go2
+    end
+
+  Author: Lich5 Community
+  Required: Lich >= 5.12.0
+  Version: 1.0.0
+=end
+
+require 'drb/drb'
+require 'json'
+require 'ostruct'
+require 'securerandom'
+
+class Cluster
+  # === Logging ===
+  module Log
+    def self.out(msg, label: :debug)
+      return unless @debug
+      return _write _view(msg, label) unless msg.is_a?(Exception)
+      _write _view(msg.message, label)
+      msg.backtrace.to_a.slice(0..5).each { |frame| _write _view(frame, label) }
+    end
+
+    def self._write(line)
+      if Script.current.vars.include?("--headless") or not defined?(:_respond)
+        $stdout.write(line + "\n")
+      elsif line.include?("<") and line.include?(">")
+        respond(line)
+      else
+        _respond Preset.as(:debug, line)
+      end
+    end
+
+    def self._view(msg, label)
+      label = [Script.current.name, label].flatten.compact.join(".")
+      "[#{label}] #{msg.inspect}"
+    end
+
+    def self.debug=(val)
+      @debug = val
+    end
+
+    def self.debug?
+      @debug
+    end
+
+    module Preset
+      def self.as(kind, body)
+        %[<preset id="#{kind}">#{body}</preset>]
+      end
+    end
+  end
+
+  # === Options Parser ===
+  module Opts
+    FLAG_PREFIX = "--"
+
+    def self.parse(args = Script.current.vars[1..-1])
+      OpenStruct.new(**args.to_a.reduce({}) do |opts, v|
+        if v.start_with?(FLAG_PREFIX)
+          name, val = v[2..-1].split("=")
+          opts[name.to_sym] = val.nil? ? true : val
+        else
+          opts[v.to_sym] = true
+        end
+        opts
+      end)
+    end
+  end
+
+  # === Constants ===
+  TTL = 5
+  NOOP = ->(_channel, _message) {}
+  UNSUPPORTED_METHOD = ->(_channel, _message) { { error: "Method not implemented on #{Char.name}" } }
+
+  # === Callback Object (exposed to broker) ===
+  class Callback
+    include DRb::DRbUndumped
+
+    def initialize(cluster)
+      @cluster = cluster
+    end
+
+    def receive_message(type, channel, from, payload)
+      @cluster._handle_message(type, channel, from, payload)
+    end
+
+    def receive_request(channel, from, payload, uuid)
+      @cluster._handle_request(channel, from, payload, uuid)
+    end
+
+    def receive_response(uuid, payload)
+      @cluster._handle_response(uuid, payload)
+    end
+
+    def ping
+      true
+    end
+  end
+
+  # === Registry Class ===
+  class Registry
+    attr_reader :namespace
+
+    def initialize(broker, namespace = Char.name)
+      @broker = broker
+      @namespace = namespace
+    end
+
+    def put(key, val)
+      @broker.registry_put(@namespace, key, val)
+    end
+
+    def get(key)
+      @broker.registry_get(@namespace, key)
+    end
+
+    def delete(key)
+      @broker.registry_delete(@namespace, key)
+    end
+
+    def exists?(key)
+      @broker.registry_exists?(@namespace, key)
+    end
+  end
+
+  # === Instance Methods ===
+
+  attr_reader :broker, :cb_map, :pending_requests
+
+  def initialize(port = "8787")
+    @cb_map = {}
+    @pending_requests = {}
+    @request_mutex = Mutex.new
+    @current_group = nil
+    @group_mutex = Mutex.new
+    @connected = {}
+
+    _connect(port)
+    _start_heartbeat
+  end
+
+  def _connect(port)
+    uri = "druby://localhost:#{port}"
+
+    # Find a free port for our callback service
+    @callback_port = 8800 + rand(1000)
+    callback_uri = "druby://localhost:#{@callback_port}"
+
+    # Start our DRb service to receive callbacks
+    @callback = Callback.new(self)
+    DRb.start_service(callback_uri, @callback)
+
+    # Connect to broker
+    retries = 0
+    begin
+      @broker = DRbObject.new_with_uri(uri)
+      @broker.register_client(Char.name, @callback, @callback_port)
+      Log.out("Connected to broker at #{uri}", label: :connect)
+    rescue DRb::DRbConnError => e
+      retries += 1
+      if retries <= 3
+        Log.out("Connection failed, retrying (#{retries}/3)...", label: :connect)
+        sleep 1
+        retry
+      else
+        raise "Could not connect to DRbCluster broker at #{uri}. Is drbcluster_broker running?"
+      end
+    end
+  end
+
+  def _start_heartbeat
+    @heartbeat_thread = Thread.new do
+      loop do
+        sleep 30
+        begin
+          @broker.heartbeat(Char.name)
+        rescue DRb::DRbConnError => e
+          Log.out("Heartbeat failed: #{e.message}", label: :heartbeat)
+        end
+      end
+    end
+  end
+
+  # === Message Handlers ===
+
+  def _handle_message(type, channel, from, payload)
+    return if from == Char.name
+
+    # Update connected tracking
+    @connected[from] = Time.now
+
+    # Build the channel key based on type
+    channel_key = case type
+    when :broadcast
+      "gs.pub.#{channel}".downcase
+    when :cast
+      "gs.#{Char.name}.#{channel}".downcase
+    when :group_broadcast
+      group_id = current_group
+      "gs.grp.#{group_id}.#{channel}".downcase if group_id
+    else
+      nil
+    end
+
+    return unless channel_key
+
+    callback = @cb_map.fetch(channel_key, NOOP)
+    begin
+      incoming = payload.is_a?(Hash) ? payload : {}
+      incoming[:from] = from
+      callback.call(channel_key, OpenStruct.new(incoming))
+    rescue StandardError => e
+      Log.out(e, label: [:dispatch, :error])
+    end
+  end
+
+  def _handle_request(channel, from, payload, uuid)
+    return if from == Char.name
+
+    @connected[from] = Time.now
+
+    # Try personal request channel first, then group request
+    channel_key = "gs.#{Char.name}.#{channel}.request".downcase
+    callback = @cb_map[channel_key]
+
+    unless callback
+      group_id = current_group
+      if group_id
+        channel_key = "gs.grp.#{group_id}.#{channel}.request".downcase
+        callback = @cb_map[channel_key]
+      end
+    end
+
+    callback ||= UNSUPPORTED_METHOD
+
+    begin
+      incoming = payload.is_a?(Hash) ? payload : {}
+      incoming[:from] = from
+      incoming[:uuid] = uuid
+      response = callback.call(channel_key, OpenStruct.new(incoming))
+      response = {} unless response.is_a?(Hash)
+      @broker.respond(Char.name, from, uuid, response)
+    rescue StandardError => e
+      Log.out(e, label: [:request, :error])
+      @broker.respond(Char.name, from, uuid, { error: e.message })
+    end
+  end
+
+  def _handle_response(uuid, payload)
+    @request_mutex.synchronize do
+      if (thread = @pending_requests[uuid])
+        @pending_requests[uuid] = payload
+        thread.wakeup if thread.is_a?(Thread)
+      end
+    end
+  end
+
+  # === Public API: Messaging ===
+
+  def broadcast(channel, **payload)
+    @broker.broadcast(Char.name, channel.to_s, payload)
+  end
+
+  def cast(person, channel: nil, **payload)
+    @broker.cast(Char.name, person.to_s, channel.to_s, payload)
+  end
+
+  def request(person, channel: nil, timeout: TTL, **payload)
+    uuid = SecureRandom.hex(10)
+
+    @request_mutex.synchronize do
+      @pending_requests[uuid] = Thread.current
+    end
+
+    success = @broker.request(Char.name, person.to_s, channel.to_s, payload, uuid)
+    unless success
+      @request_mutex.synchronize { @pending_requests.delete(uuid) }
+      return Exception.new("Target #{person} not connected")
+    end
+
+    timeout_thread = Thread.new do
+      sleep timeout
+      @request_mutex.synchronize do
+        if @pending_requests[uuid].is_a?(Thread)
+          @pending_requests[uuid].wakeup
+        end
+      end
+    end
+
+    Thread.stop
+
+    timeout_thread.kill
+    resp = @request_mutex.synchronize { @pending_requests.delete(uuid) }
+
+    return TimeoutError.new("Request to #{person} timed out after #{timeout}s") if resp.is_a?(Thread)
+    return Exception.new(resp[:error]) if resp.is_a?(Hash) && resp[:error]
+    OpenStruct.new(resp)
+  end
+
+  def async_request(*args, **kwargs)
+    Thread.new { request(*args, **kwargs) }
+  end
+
+  def map(people, **payload)
+    people.map { |name| Thread.new { request(name, **payload) } }.map(&:value)
+  end
+
+  # === Public API: Handlers ===
+
+  def on_broadcast(channel, &block)
+    fail "No block given to on_broadcast" unless block_given?
+    @cb_map["gs.pub.#{channel}".downcase] = block
+    self
+  end
+
+  def on_cast(channel, &block)
+    fail "No block given to on_cast" unless block_given?
+    @cb_map["gs.#{Char.name}.#{channel}".downcase] = block
+    self
+  end
+
+  def on_request(channel, &block)
+    fail "No block given to on_request" unless block_given?
+    @cb_map["gs.#{Char.name}.#{channel}.request".downcase] = block
+    self
+  end
+
+  # === Public API: Groups ===
+
+  def join_group(group_id)
+    @group_mutex.synchronize do
+      @current_group = group_id.to_s.downcase
+    end
+    @broker.join_group(Char.name, group_id)
+    self
+  end
+
+  def leave_group
+    @group_mutex.synchronize do
+      @current_group = nil
+    end
+    @broker.leave_group(Char.name)
+    self
+  end
+
+  def current_group
+    @group_mutex.synchronize { @current_group }
+  end
+
+  def in_group?
+    !!current_group
+  end
+
+  def group_broadcast(channel, group_id: nil, **payload)
+    gid = group_id || current_group
+    fail "Not in a group. Call join_group first or pass group_id:" unless gid
+    @broker.group_broadcast(Char.name, gid, channel.to_s, payload)
+  end
+
+  def on_group(channel, group_id: nil, &block)
+    fail "No block given to on_group" unless block_given?
+    gid = group_id || current_group
+    fail "Not in a group" unless gid
+    @cb_map["gs.grp.#{gid}.#{channel}".downcase] = block
+    self
+  end
+
+  def group_request(channel, group_id: nil, timeout: TTL, **payload)
+    gid = group_id || current_group
+    fail "Not in a group. Call join_group first or pass group_id:" unless gid
+
+    uuid = SecureRandom.hex(10)
+
+    @request_mutex.synchronize do
+      @pending_requests[uuid] = Thread.current
+    end
+
+    @broker.group_request(Char.name, gid, channel.to_s, payload, uuid)
+
+    timeout_thread = Thread.new do
+      sleep timeout
+      @request_mutex.synchronize do
+        if @pending_requests[uuid].is_a?(Thread)
+          @pending_requests[uuid].wakeup
+        end
+      end
+    end
+
+    Thread.stop
+
+    timeout_thread.kill
+    resp = @request_mutex.synchronize { @pending_requests.delete(uuid) }
+
+    return TimeoutError.new("Group request timed out after #{timeout}s") if resp.is_a?(Thread)
+    return Exception.new(resp[:error]) if resp.is_a?(Hash) && resp[:error]
+    OpenStruct.new(resp)
+  end
+
+  def on_group_request(channel, group_id: nil, &block)
+    fail "No block given to on_group_request" unless block_given?
+    gid = group_id || current_group
+    fail "Not in a group" unless gid
+    @cb_map["gs.grp.#{gid}.#{channel}.request".downcase] = block
+    self
+  end
+
+  # === Public API: Status ===
+
+  def connected
+    @broker.connected_clients
+  end
+
+  def alive?(name)
+    @broker.alive?(name)
+  end
+
+  # === Cleanup ===
+
+  def destroy
+    Log.out("Cleaning up...", label: :destroy)
+    broadcast(:leave)
+    group_broadcast(:leave) if in_group? rescue nil
+    @broker.unregister_client(Char.name)
+    @heartbeat_thread&.kill
+    DRb.stop_service
+  end
+
+  # === Class Methods (Singleton Pattern) ===
+
+  @cluster = nil
+
+  def self.of(port = nil)
+    port ||= Opts.parse.port || "8787"
+    cluster = Cluster.new(port)
+    before_dying { cluster.destroy }
+    cluster.on_request(:api) { |_, _| { methods: cluster.cb_map.keys } }
+    cluster.on_broadcast(:announce) { |_, req| cluster.cast(req.from, channel: :ack) }
+    cluster.broadcast(:announce)
+    cluster
+  end
+
+  def self.cluster
+    @cluster
+  end
+
+  def self.up?
+    !@cluster.nil?
+  end
+
+  def self.init(port = nil)
+    return @cluster if up?
+    @cluster = Cluster.of(port)
+  end
+
+  # Delegate class methods to instance
+  def self.method_missing(method, *args, **kwargs, &block)
+    init
+    fail "Cluster.init() must be called first" unless up?
+    @cluster.send(method, *args, **kwargs, &block)
+  end
+
+  def self.respond_to_missing?(method, include_private = false)
+    init
+    up? && @cluster.respond_to?(method, include_private)
+  end
+
+  # === Registry Factory ===
+
+  def self.registry(namespace = nil)
+    init
+    Registry.new(@cluster.broker, namespace || Char.name)
+  end
+
+  def self.pool
+    # Compatibility shim - DRb doesn't need connection pooling
+    # Returns broker reference for direct access if needed
+    @cluster&.broker
+  end
+
+  def self.parse(str)
+    JSON.parse(str, symbolize_names: true)
+  end
+end
+
+# === Contracts Module ===
+# This is API-compatible with the Redis cluster.lic Contracts module
+
+module Contracts
+  SHOULD_NEVER_RUN = ->(_req) { fail "won invalid contract" }
+  INVALID_BID = ->(_req) { -1 }
+  VALID_BID = (0..1)
+  TTL = 1
+  OPEN_CONTRACTS ||= {}
+  OPEN_BIDS ||= {}
+  CALLBACKS ||= {}
+
+  module Events
+    CONTRACT_OPEN = :contract_open
+    CONTRACT_CLOSE = :contract_close
+    CONTRACT_BID = :contract_bid
+    CONTRACT_WIN = :contract_win
+  end
+
+  Cluster.on_broadcast(Events::CONTRACT_OPEN) do |_, req|
+    Contracts.prune
+    Contracts.maybe_bid(req)
+  end
+
+  Cluster.on_cast(Events::CONTRACT_BID) do |_, req|
+    Cluster::Log.out(req, label: Events::CONTRACT_BID)
+    Contracts.fetch_open_contract(req.contract_id) do |contract|
+      contract[:bids].push(req)
+    end
+  end
+
+  Cluster.on_cast(Events::CONTRACT_WIN) do |_, req|
+    OPEN_BIDS.delete(req.contract_id)
+    CALLBACKS.fetch(req.kind.to_sym, {})
+             .fetch(Events::CONTRACT_WIN, SHOULD_NEVER_RUN)
+             .call(req)
+  end
+
+  def self.fetch_open_contract(contract_id)
+    prune
+    if (contract = OPEN_CONTRACTS.fetch(contract_id, false))
+      yield(contract)
+    end
+  end
+
+  def self.next_expiry
+    (Time.now.utc + TTL).to_s
+  end
+
+  def self.prune
+    [OPEN_CONTRACTS, OPEN_BIDS].each do |kv|
+      kv.each do |id, contract|
+        kv.delete(id) if expired?(contract)
+      end
+    end
+  end
+
+  def self.expired?(contract)
+    Time.now.utc > Time.parse(contract[:expiry])
+  end
+
+  def self.closed?(contract)
+    expired?(contract) || contract.fetch(:bids).size == contract.fetch(:valid_bidders).size
+  end
+
+  def self.make_contract(**args)
+    args.merge({
+      contract_id: SecureRandom.hex(10),
+      kind: args.fetch(:kind).to_s.downcase.to_sym,
+      from: Char.name,
+      expiry: next_expiry,
+      bids: []
+    })
+  end
+
+  def self.maybe_bid(contract)
+    return unless contract.valid_bidders.include?(Char.name)
+
+    bid_for_contract = CALLBACKS.fetch(contract.kind.to_sym, {})
+                                .fetch(Events::CONTRACT_OPEN, INVALID_BID)
+                                .call(contract)
+
+    bid_for_contract = -1 unless bid_for_contract > contract.min_bid
+
+    OPEN_BIDS[contract.contract_id] = contract if VALID_BID.include?(bid_for_contract)
+
+    Contracts.bid(contract, bid_for_contract)
+  end
+
+  def self.collect_bids(kind, valid_bidders:, min_bid: 0, **vars)
+    prune
+    contract = make_contract(
+      vars.merge({ kind: kind, valid_bidders: valid_bidders, min_bid: min_bid })
+    )
+    OPEN_CONTRACTS[contract[:contract_id]] = contract
+    Cluster::Log.out(contract, label: Events::CONTRACT_OPEN)
+    Cluster.broadcast(Events::CONTRACT_OPEN, **contract)
+    sleep 0.01 until closed?(contract)
+    valid_bids = contract[:bids].select { |resp| VALID_BID.include?(resp.bid) }
+    return yield(contract) if (expired?(contract) && valid_bids.empty?) || (valid_bids.empty? && block_given?)
+    winning_bid = valid_bids.max_by { |b| b.bid }
+    Cluster::Log.out(winning_bid, label: :winning_bid)
+    tell_remote_winner(winning_bid[:from], contract)
+  end
+
+  def self.on_contract(kind, callbacks)
+    callbacks.fetch(Events::CONTRACT_OPEN) && callbacks.fetch(Events::CONTRACT_WIN)
+    CALLBACKS[kind] = callbacks
+    self
+  end
+
+  def self.tell_remote_winner(winner, contract)
+    Cluster.cast(winner, contract.merge({ channel: Events::CONTRACT_WIN }))
+  end
+
+  def self.bid(contract, value)
+    Cluster::Log.out("bidding #{value} on Contract(#{contract.contract_id}) from #{contract.from}", label: :bid)
+    Cluster.cast(contract[:from], {
+      channel: Events::CONTRACT_BID,
+      contract_id: contract[:contract_id],
+      bid: value
+    })
+  end
+end
+
+# === Initialization ===
+
+opts = Cluster::Opts.parse
+Cluster::Log.debug = opts.debug
+
+Cluster.init(opts.port)
+
+_respond "Cluster (DRb) connected as #{Char.name}"
+
+# Load user callbacks if they exist
+if Script.exists?("drbcluster_callbacks.rb")
+  load("scripts/drbcluster_callbacks.rb")
+end
+
+# Keep alive
+loop { sleep 1 }
