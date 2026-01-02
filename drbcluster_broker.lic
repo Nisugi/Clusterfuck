@@ -1,0 +1,424 @@
+=begin
+  DRbCluster Broker - Distributed Ruby Cluster Service
+
+  This is the broker/server component of DRbCluster. Start this script first,
+  then run drbcluster.lic on each character to connect.
+
+  Usage:
+    ;drbcluster_broker              # Start on default port 8787
+    ;drbcluster_broker --port=9000  # Start on custom port
+    ;drbcluster_broker --debug      # Enable debug logging
+
+  Author: Lich5 Community
+  Required: Lich >= 5.12.0
+  Version: 1.0.0
+
+  Version Control:
+    v1.0.0 - Initial release
+=end
+
+require 'drb/drb'
+require 'json'
+require 'ostruct'
+require 'set'
+
+module DRbClusterBroker
+  module Log
+    def self.out(msg, label: :debug)
+      return unless @debug
+      return _write _view(msg, label) unless msg.is_a?(Exception)
+      _write _view(msg.message, label)
+      msg.backtrace.to_a.slice(0..5).each { |frame| _write _view(frame, label) }
+    end
+
+    def self._write(line)
+      if defined?(_respond)
+        _respond Preset.as(:debug, line)
+      else
+        $stdout.puts(line)
+      end
+    end
+
+    def self._view(msg, label)
+      label = [Script.current.name, label].flatten.compact.join(".")
+      "[#{label}] #{msg.inspect}"
+    end
+
+    def self.debug=(val)
+      @debug = val
+    end
+
+    def self.debug?
+      @debug
+    end
+
+    module Preset
+      def self.as(kind, body)
+        %[<preset id="#{kind}">#{body}</preset>]
+      end
+    end
+  end
+
+  module Opts
+    FLAG_PREFIX = "--"
+
+    def self.parse(args = Script.current.vars[1..-1])
+      OpenStruct.new(**args.to_a.reduce({}) do |opts, v|
+        if v.start_with?(FLAG_PREFIX)
+          name, val = v[2..-1].split("=")
+          opts[name.to_sym] = val.nil? ? true : val
+        else
+          opts[v.to_sym] = true
+        end
+        opts
+      end)
+    end
+  end
+
+  # Client record stored in the broker
+  class ClientRecord
+    attr_accessor :name, :callback, :last_seen, :port
+
+    def initialize(name, callback, port)
+      @name = name
+      @callback = callback
+      @port = port
+      @last_seen = Time.now
+    end
+
+    def touch
+      @last_seen = Time.now
+    end
+
+    def alive?(timeout = 60)
+      (Time.now - @last_seen).abs < timeout
+    end
+  end
+
+  # The main broker service exposed via DRb
+  class Broker
+    include DRb::DRbUndumped
+
+    HEARTBEAT_TIMEOUT = 60
+    REQUEST_TIMEOUT = 30
+
+    attr_reader :clients
+
+    def initialize
+      @clients = {}
+      @client_mutex = Mutex.new
+
+      @groups = {}           # group_id => Set of client names
+      @client_groups = {}    # client_name => group_id
+      @group_mutex = Mutex.new
+
+      @registry = {}
+      @registry_mutex = Mutex.new
+
+      @pending_requests = {}
+      @request_mutex = Mutex.new
+
+      start_cleanup_thread
+    end
+
+    # === Client Registration ===
+
+    def register_client(name, callback, port)
+      @client_mutex.synchronize do
+        @clients[name] = ClientRecord.new(name, callback, port)
+        Log.out("Client registered: #{name} on port #{port}", label: :register)
+      end
+      true
+    end
+
+    def unregister_client(name)
+      @client_mutex.synchronize do
+        @clients.delete(name)
+      end
+      @group_mutex.synchronize do
+        if (group_id = @client_groups.delete(name))
+          @groups[group_id]&.delete(name)
+          @groups.delete(group_id) if @groups[group_id]&.empty?
+        end
+      end
+      Log.out("Client unregistered: #{name}", label: :unregister)
+      true
+    end
+
+    def heartbeat(name)
+      @client_mutex.synchronize do
+        @clients[name]&.touch
+      end
+      true
+    end
+
+    def connected_clients
+      @client_mutex.synchronize do
+        @clients.select { |_, r| r.alive?(HEARTBEAT_TIMEOUT) }.keys
+      end
+    end
+
+    def alive?(name)
+      @client_mutex.synchronize do
+        @clients[name]&.alive?(HEARTBEAT_TIMEOUT) || false
+      end
+    end
+
+    # === Basic Messaging ===
+
+    def broadcast(from, channel, payload)
+      clients_snapshot = @client_mutex.synchronize { @clients.dup }
+      count = 0
+      clients_snapshot.each do |name, record|
+        next if name == from
+        next unless record.alive?(HEARTBEAT_TIMEOUT)
+        Thread.new do
+          begin
+            record.callback.receive_message(:broadcast, channel, from, payload)
+          rescue DRb::DRbConnError => e
+            Log.out("Failed to deliver to #{name}: #{e.message}", label: :broadcast_error)
+          end
+        end
+        count += 1
+      end
+      count
+    end
+
+    def cast(from, to, channel, payload)
+      record = @client_mutex.synchronize { @clients[to] }
+      return false unless record&.alive?(HEARTBEAT_TIMEOUT)
+      Thread.new do
+        begin
+          record.callback.receive_message(:cast, channel, from, payload)
+        rescue DRb::DRbConnError => e
+          Log.out("Failed to cast to #{to}: #{e.message}", label: :cast_error)
+        end
+      end
+      true
+    end
+
+    # === Request/Response ===
+
+    def request(from, to, channel, payload, uuid)
+      record = @client_mutex.synchronize { @clients[to] }
+      return false unless record&.alive?(HEARTBEAT_TIMEOUT)
+
+      @request_mutex.synchronize do
+        @pending_requests[uuid] = { from: from, to: to, timestamp: Time.now }
+      end
+
+      Thread.new do
+        begin
+          record.callback.receive_request(channel, from, payload, uuid)
+        rescue DRb::DRbConnError => e
+          Log.out("Failed to send request to #{to}: #{e.message}", label: :request_error)
+          # Send error response back
+          respond(to, from, uuid, { error: "Target unreachable: #{e.message}" })
+        end
+      end
+      true
+    end
+
+    def respond(from, to, uuid, payload)
+      @request_mutex.synchronize { @pending_requests.delete(uuid) }
+
+      record = @client_mutex.synchronize { @clients[to] }
+      return false unless record
+
+      Thread.new do
+        begin
+          record.callback.receive_response(uuid, payload)
+        rescue DRb::DRbConnError => e
+          Log.out("Failed to send response to #{to}: #{e.message}", label: :response_error)
+        end
+      end
+      true
+    end
+
+    # === Group Management ===
+
+    def join_group(client_name, group_id)
+      @group_mutex.synchronize do
+        # Leave current group first
+        if (old_group = @client_groups[client_name])
+          @groups[old_group]&.delete(client_name)
+          @groups.delete(old_group) if @groups[old_group]&.empty?
+        end
+
+        # Join new group
+        group_id = group_id.to_s.downcase
+        @groups[group_id] ||= Set.new
+        @groups[group_id].add(client_name)
+        @client_groups[client_name] = group_id
+        Log.out("#{client_name} joined group #{group_id}", label: :group)
+      end
+      true
+    end
+
+    def leave_group(client_name)
+      @group_mutex.synchronize do
+        if (group_id = @client_groups.delete(client_name))
+          @groups[group_id]&.delete(client_name)
+          @groups.delete(group_id) if @groups[group_id]&.empty?
+          Log.out("#{client_name} left group #{group_id}", label: :group)
+          return group_id
+        end
+      end
+      nil
+    end
+
+    def get_group_members(group_id)
+      @group_mutex.synchronize do
+        @groups[group_id.to_s.downcase]&.to_a || []
+      end
+    end
+
+    def get_client_group(client_name)
+      @group_mutex.synchronize { @client_groups[client_name] }
+    end
+
+    def group_broadcast(from, group_id, channel, payload)
+      members = get_group_members(group_id)
+      clients_snapshot = @client_mutex.synchronize { @clients.dup }
+      count = 0
+
+      members.each do |name|
+        next if name == from
+        record = clients_snapshot[name]
+        next unless record&.alive?(HEARTBEAT_TIMEOUT)
+        Thread.new do
+          begin
+            record.callback.receive_message(:group_broadcast, channel, from, payload)
+          rescue DRb::DRbConnError => e
+            Log.out("Failed to group_broadcast to #{name}: #{e.message}", label: :group_error)
+          end
+        end
+        count += 1
+      end
+      count
+    end
+
+    def group_request(from, group_id, channel, payload, uuid)
+      members = get_group_members(group_id)
+      clients_snapshot = @client_mutex.synchronize { @clients.dup }
+
+      @request_mutex.synchronize do
+        @pending_requests[uuid] = { from: from, group: group_id, timestamp: Time.now }
+      end
+
+      members.each do |name|
+        next if name == from
+        record = clients_snapshot[name]
+        next unless record&.alive?(HEARTBEAT_TIMEOUT)
+        Thread.new do
+          begin
+            record.callback.receive_request(channel, from, payload, uuid)
+          rescue DRb::DRbConnError => e
+            Log.out("Failed to group_request to #{name}: #{e.message}", label: :group_error)
+          end
+        end
+      end
+      true
+    end
+
+    # === Registry (Key-Value Store) ===
+
+    def registry_put(namespace, key, value)
+      full_key = "#{namespace}.#{key}".downcase
+      @registry_mutex.synchronize do
+        @registry[full_key] = value.to_json
+      end
+      true
+    end
+
+    def registry_get(namespace, key)
+      full_key = "#{namespace}.#{key}".downcase
+      @registry_mutex.synchronize do
+        val = @registry[full_key]
+        val ? JSON.parse(val, symbolize_names: true) : nil
+      end
+    end
+
+    def registry_delete(namespace, key)
+      full_key = "#{namespace}.#{key}".downcase
+      @registry_mutex.synchronize do
+        @registry.delete(full_key)
+      end
+      true
+    end
+
+    def registry_exists?(namespace, key)
+      full_key = "#{namespace}.#{key}".downcase
+      @registry_mutex.synchronize do
+        @registry.key?(full_key)
+      end
+    end
+
+    # === Cleanup ===
+
+    def shutdown
+      Log.out("Broker shutting down...", label: :shutdown)
+      # Notify all clients
+      @client_mutex.synchronize { @clients.dup }.each do |name, record|
+        begin
+          record.callback.receive_message(:broadcast, :broker_shutdown, "broker", {})
+        rescue
+          # Ignore errors during shutdown
+        end
+      end
+    end
+
+    private
+
+    def start_cleanup_thread
+      Thread.new do
+        loop do
+          sleep 30
+          cleanup_stale_clients
+          cleanup_stale_requests
+        end
+      end
+    end
+
+    def cleanup_stale_clients
+      stale = @client_mutex.synchronize do
+        @clients.select { |_, r| !r.alive?(HEARTBEAT_TIMEOUT) }.keys
+      end
+      stale.each { |name| unregister_client(name) }
+    end
+
+    def cleanup_stale_requests
+      @request_mutex.synchronize do
+        @pending_requests.delete_if do |uuid, req|
+          (Time.now - req[:timestamp]) > REQUEST_TIMEOUT
+        end
+      end
+    end
+  end
+end
+
+# === Main Entry Point ===
+
+opts = DRbClusterBroker::Opts.parse
+DRbClusterBroker::Log.debug = opts.debug
+
+port = opts.port || "8787"
+uri = "druby://localhost:#{port}"
+
+broker = DRbClusterBroker::Broker.new
+
+before_dying do
+  broker.shutdown
+  DRb.stop_service
+end
+
+DRb.start_service(uri, broker)
+_respond "DRbCluster Broker started on #{uri}"
+_respond "Waiting for clients to connect..."
+
+if opts.debug
+  _respond "Debug mode enabled"
+end
+
+# Keep alive
+loop { sleep 1 }
