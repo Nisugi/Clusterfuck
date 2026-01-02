@@ -503,14 +503,23 @@ class RealPerformanceTest
     puts "\n  Testing #{config[:name].upcase}..."
 
     begin
-      # Start DRb service with callback
-      callback = DRbTestCallback.new
-      DRb.start_service("druby://localhost:0", callback) rescue nil
+      # Start DRb service first (allows callbacks to be remotely callable)
+      DRb.start_service("druby://localhost:0") rescue nil
+      local_port = DRb.uri.split(':').last.to_i
+
       broker = DRbObject.new_with_uri(config[:uri])
 
-      # Register as a test client
-      client_name = "PerfTest_#{SecureRandom.hex(4)}"
-      broker.register_client(client_name, callback, DRb.uri.split(':').last.to_i)
+      # Create TWO clients: sender and receiver
+      # This is needed because broadcasts skip the sender
+      sender_callback = DRbTestCallback.new
+      receiver_callback = DRbTestCallback.new
+
+      sender_name = "PerfTest_Sender_#{SecureRandom.hex(4)}"
+      receiver_name = "PerfTest_Receiver_#{SecureRandom.hex(4)}"
+
+      # Both callbacks have DRbUndumped, so they're callable via the running DRb service
+      broker.register_client(sender_name, sender_callback, local_port)
+      broker.register_client(receiver_name, receiver_callback, local_port)
 
       results_key = "drb_#{server_key}"
       @results[results_key] = {}
@@ -523,17 +532,18 @@ class RealPerformanceTest
       # Method call latency test (basic RPC)
       @results[results_key][:call] = test_drb_call_latency(broker, config[:name])
 
-      # Message round-trip test (like Redis pub/sub)
-      @results[results_key][:message] = test_drb_message_latency(broker, callback, client_name, config[:name])
+      # Message round-trip test - sender broadcasts, receiver gets it
+      @results[results_key][:message] = test_drb_message_latency(broker, receiver_callback, sender_name, config[:name])
 
       # Registry test
       @results[results_key][:registry] = test_drb_registry(broker, config[:name])
 
-      # Throughput test
-      @results[results_key][:throughput] = test_drb_throughput(broker, callback, client_name, config[:name])
+      # Throughput test - sender broadcasts, receiver counts
+      @results[results_key][:throughput] = test_drb_throughput(broker, receiver_callback, sender_name, config[:name])
 
       # Cleanup
-      broker.unregister_client(client_name) rescue nil
+      broker.unregister_client(sender_name) rescue nil
+      broker.unregister_client(receiver_name) rescue nil
 
     rescue => e
       puts "    ERROR: #{e.message}"
