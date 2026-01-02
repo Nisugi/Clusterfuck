@@ -1,0 +1,340 @@
+# GemStone Cluster Server Infrastructure
+
+## Overview
+
+Three Redis servers for GemStone cluster communication with failover capability.
+All connections use TLS encryption.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     GemStone Players                            │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   Failover Logic (TLS)                          │
+│         Try: Primary → Backup 1 → Backup 2                      │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+        ┌─────────────────┼─────────────────┐
+        ▼                 ▼                 ▼
+┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│   PRIMARY     │ │   BACKUP 1    │ │   BACKUP 2    │
+│   Contabo     │ │ Google Cloud  │ │   Upstash     │
+│   (TLS)       │ │   (TLS)       │ │   (TLS)       │
+└───────────────┘ └───────────────┘ └───────────────┘
+```
+
+---
+
+## Domain: gs-game.uk (Cloudflare DNS)
+
+| Subdomain | Points To | Purpose |
+|-----------|-----------|---------|
+| primary.gs-game.uk | 158.220.127.134 | Redis primary (TLS) |
+| backup.gs-game.uk | 34.10.123.196 | Redis backup (TLS) |
+| blue-tracker.gs-game.uk | 158.220.127.134 | Website |
+
+**Registrar:** Cloudflare
+**DNS Provider:** Cloudflare (DNS only mode for Redis subdomains)
+
+---
+
+## Server Details
+
+### 1. PRIMARY: Contabo VPS
+
+| Property | Value |
+|----------|-------|
+| **IP** | 158.220.127.134 |
+| **Domain** | primary.gs-game.uk |
+| **Provider** | Contabo |
+| **OS** | Ubuntu 24.04 |
+| **Services** | nginx (website), Redis, PostgreSQL, Discord bot |
+
+**Redis Configuration:**
+| Setting | Value |
+|---------|-------|
+| Port | 42113 (TLS only) |
+| Password | (stored in password manager) |
+| TLS | Enabled (Let's Encrypt) |
+| Cert Path | /etc/redis/tls/ |
+| Disabled Commands | FLUSHALL, FLUSHDB, CONFIG, DEBUG, KEYS, etc. |
+
+**Security Measures:**
+- [x] SSH key authentication only (password disabled)
+- [x] Non-standard SSH port (42424)
+- [x] UFW firewall configured
+- [x] Fail2ban installed
+- [x] Redis password required
+- [x] Redis dangerous commands disabled
+- [x] Automatic security updates enabled
+- [x] TLS for Redis (Let's Encrypt)
+- [x] Auto-renewal hook for certificates
+
+**Firewall Rules (UFW):**
+```
+22/tcp    DENY    (SSH)
+80/tcp    ALLOW   (HTTP/certbot)
+443/tcp   ALLOW   (HTTPS)
+42113/tcp ALLOW   (Redis TLS)
+42424/tcp ALLOW   (SSH)
+6379/tcp  DENY    (old Redis port blocked)
+```
+
+---
+
+### 2. BACKUP 1: Google Cloud
+
+| Property | Value |
+|----------|-------|
+| **IP** | 34.10.123.196 |
+| **Domain** | backup.gs-game.uk |
+| **Provider** | Google Cloud (free tier) |
+| **Instance** | gemstone-redis-backup |
+| **Region** | us-central1 (Iowa) |
+| **Machine** | e2-micro (free tier) |
+| **OS** | Ubuntu 22.04 |
+| **Services** | Redis only |
+
+**Redis Configuration:**
+| Setting | Value |
+|---------|-------|
+| Port | 42113 (TLS only) |
+| Password | (stored in password manager) |
+| TLS | Enabled (Let's Encrypt) |
+| Cert Path | /etc/redis/tls/ |
+| Disabled Commands | Same as Contabo (Redis 6 compatible) |
+
+**Security Measures:**
+- [x] SSH key authentication only
+- [x] Non-standard SSH port (42424)
+- [x] Google Cloud firewall configured
+- [x] Fail2ban installed
+- [x] Redis password required
+- [x] Redis dangerous commands disabled
+- [x] TLS for Redis (Let's Encrypt)
+- [x] Auto-renewal hook for certificates
+
+**Google Cloud Firewall Rules:**
+```
+allow-ssh-42424    TCP:42424   (SSH)
+allow-redis        TCP:42113   (Redis TLS)
+allow-http-certbot TCP:80      (certbot)
+```
+
+**Deleted/Disabled Rules:**
+- default-allow-rdp (not needed for Linux)
+- default-allow-ssh (port 22, replaced with custom port)
+
+---
+
+### 3. BACKUP 2: Upstash
+
+| Property | Value |
+|----------|-------|
+| **Endpoint** | sensible-vervet-9854.upstash.io |
+| **Port** | 6379 |
+| **Provider** | Upstash (free tier) |
+| **TLS** | Required (use `rediss://` or `ssl: true`) |
+| **Password** | (stored in password manager) |
+
+**Connection URL:**
+```
+rediss://default:PASSWORD@sensible-vervet-9854.upstash.io:6379
+```
+
+**Free Tier Limits:**
+- 500K commands/month
+- 256 MB storage
+- 100 concurrent connections
+
+**Security:**
+- [x] TLS enabled by default
+- [x] Password authentication required
+- [x] Managed by Upstash (no server maintenance)
+
+---
+
+## Failover Logic (cluster.lic)
+
+```ruby
+# In cluster.lic - PUBLIC_SERVERS constant
+[
+  {
+    name: "contabo",
+    host: "primary.gs-game.uk",
+    port: 42113,
+    password: "PASSWORD",
+    ssl: true
+  },
+  {
+    name: "google",
+    host: "backup.gs-game.uk",
+    port: 42113,
+    password: "PASSWORD",
+    ssl: true
+  },
+  {
+    name: "upstash",
+    host: "sensible-vervet-9854.upstash.io",
+    port: 6379,
+    password: "UPSTASH_PASSWORD",
+    ssl: true
+  },
+]
+```
+
+**Usage:**
+```
+;cluster --public
+```
+
+**Check connected server:**
+```
+;e echo Cluster.connected_server
+```
+
+---
+
+## Quick Commands
+
+**SSH into servers:**
+```powershell
+ssh contabo
+ssh gcloud-redis
+```
+
+**Check Redis status:**
+```bash
+sudo systemctl status redis-server
+```
+
+**Test Redis TLS connection:**
+```bash
+redis-cli -h primary.gs-game.uk -p 42113 --tls -a 'PASSWORD' ping
+redis-cli -h backup.gs-game.uk -p 42113 --tls -a 'PASSWORD' ping
+```
+
+**Check what's listening:**
+```bash
+sudo ss -tlnp
+```
+
+**Check firewall:**
+```bash
+# Contabo
+sudo ufw status
+
+# Google Cloud - use Console or:
+gcloud compute firewall-rules list
+```
+
+**Restart Redis:**
+```bash
+sudo systemctl restart redis-server
+```
+
+**Check fail2ban:**
+```bash
+sudo fail2ban-client status sshd
+```
+
+**Check certificate expiry:**
+```bash
+sudo certbot certificates
+```
+
+---
+
+## Security Monitoring & Rootkit Detection
+
+### Tools Installed (Both Servers)
+
+| Tool | Purpose |
+|------|---------|
+| **rkhunter** | Rootkit Hunter - scans for rootkits, backdoors, exploits |
+| **chkrootkit** | Checks for signs of rootkits |
+| **Lynis** | Security auditing and hardening tool |
+
+### Installation (if not already installed)
+```bash
+sudo apt install rkhunter chkrootkit lynis -y
+```
+
+### Quick Commands
+
+**Run rootkit scan:**
+```bash
+# Rootkit Hunter (update first, then scan)
+sudo rkhunter --update
+sudo rkhunter --check --sk
+
+# chkrootkit
+sudo chkrootkit
+
+# Lynis full audit
+sudo lynis audit system
+```
+
+**Check scan results:**
+```bash
+# rkhunter log
+sudo cat /var/log/rkhunter.log | grep -i warning
+
+# Lynis report
+sudo cat /var/log/lynis-report.dat
+```
+
+**Update rkhunter database (after system updates):**
+```bash
+sudo rkhunter --propupd
+```
+
+### Automated Scans (Cron)
+
+Add to `/etc/crontab` or use `crontab -e`:
+```bash
+# Weekly rootkit scan (Sundays at 3am)
+0 3 * * 0 root /usr/bin/rkhunter --check --sk --report-warnings-only | mail -s "rkhunter weekly scan" root
+
+# Daily chkrootkit (2am)
+0 2 * * * root /usr/sbin/chkrootkit | grep -v "not found" | grep -v "nothing found"
+```
+
+### Common False Positives
+
+rkhunter may flag these as warnings (usually safe to ignore):
+- `/usr/bin/lwp-request` - Perl HTTP client
+- Hidden directories in `/dev/.udev` - Normal for udev
+- SSH root login warning - Expected if using key auth
+
+To whitelist in `/etc/rkhunter.conf`:
+```conf
+ALLOWHIDDENDIR=/dev/.udev
+SCRIPTWHITELIST=/usr/bin/lwp-request
+```
+
+---
+
+## Emergency Contacts / Resources
+
+- **Contabo Support:** https://contabo.com/en/support/
+- **Google Cloud Console:** https://console.cloud.google.com
+- **Cloudflare Dashboard:** https://dash.cloudflare.com
+- **Upstash:** https://upstash.com
+- **Let's Encrypt Status:** https://letsencrypt.status.io/
+
+---
+
+## Revision History
+
+| Date | Change |
+|------|--------|
+| 2026-01-01 | Initial setup - Contabo and Google Cloud secured |
+| 2026-01-01 | SSH moved to port 42424 on both servers |
+| 2026-01-01 | Redis configured on port 42113 with passwords |
+| 2026-01-02 | Purchased gs-game.uk domain (Cloudflare DNS) |
+| 2026-01-02 | TLS enabled on both servers with Let's Encrypt |
+| 2026-01-02 | Auto-renewal hooks configured for certificates |
+| 2026-01-02 | Upstash added to cluster.lic failover |
